@@ -1,0 +1,279 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Setting up the AutoStop and / or AutoStart on all regions and all instances
+
+Parameters: 
+  DeployAutoStop: 
+    Description: Allows to deploy lambda AutoStop.
+    Default: true
+    AllowedValues:
+      - true
+      - false
+    Type: String
+  AutoStopRate:
+    Description: >
+      The rate (frequency) that determines when triggers the AutoStop Lambda function .
+      https://docs.aws.amazon.com/fr_fr/AmazonCloudWatch/latest/events/ScheduledEvents.html#CronExpressions
+    Default: cron(0 20 ? * MON-FRI *)
+    Type: String
+  AutoStopTag:
+    Description: AutoStop tag to add on your instances
+    Default: AutoStop
+    Type: String
+  DeployAutoStart: 
+    Description: Allows to deploy lambda AutoStart.
+    Default: true
+    AllowedValues:
+      - true
+      - false
+    Type: String
+  AutoStartRate:
+    Description: >
+      The rate (frequency) that determines when triggers the AutoStart Lambda function .
+      https://docs.aws.amazon.com/fr_fr/AmazonCloudWatch/latest/events/ScheduledEvents.html#CronExpressions
+    Default: cron(0 7 ? * MON-FRI *)
+    Type: String
+  AutoStartTag:
+    Description: AutoStart tag to add on your instances
+    Default: AutoStart
+    Type: String
+
+Conditions: 
+  DeployAutoStopCondition: !Equals [true, !Ref DeployAutoStop]
+  DeployAutoStartCondition: !Equals [true, !Ref DeployAutoStart]
+
+Resources:
+  LambdaAutoStopFunction:
+    Type: AWS::Lambda::Function
+    Condition: DeployAutoStopCondition
+    Properties:
+      Code:
+        ZipFile: |
+          from __future__ import print_function
+          import boto3
+          import os
+          filters_auto_stop = [
+              {
+                  'Name': 'tag:' + os.environ['EnvAutoStopTag'],
+                  'Values': ['True', 'true']
+              },
+              {
+                  'Name': 'instance-state-name',
+                  'Values': ['running']
+              }
+          ]
+
+          def get_tag_value(instance, key):
+              for tags in instance.tags:
+                  if tags["Key"] == key:
+                      return tags["Value"]
+              return null
+
+          def auto_stop_all_regions():
+              ec2 = boto3.resource('ec2')
+              ec2_client = boto3.client('ec2')
+              
+              filters = list(filters_auto_stop)
+              
+              for region in ec2_client.describe_regions()['Regions']:
+                  print("-----  Stop instances for region %s  -----" % (region['RegionName']))
+                  ec2 = boto3.resource('ec2', region_name=region['RegionName'])
+                  instances = list(ec2.instances.filter(Filters=filters))
+                  print("\tStopping %s instance(s)" % (len(instances)))
+                  if len(instances) > 0:
+                      for instance in instances:
+                          print("\tStop: %s" % (get_tag_value(instance,'Name')))
+                          instance.stop()
+              
+                      for instance in instances:
+                          print("\tWait instance stopping: %s" % (get_tag_value(instance,'Name')))
+                          instance.wait_until_stopped()
+
+          def lambda_handler(event, context):
+              auto_stop_all_regions()
+
+          if __name__ == '__main__':
+              lambda_handler(None, None)
+
+      Handler: index.lambda_handler
+      FunctionName: !Sub
+        - ${AutoStopTag}_all_regions
+        - { AutoStopTag: !Ref AutoStopTag }
+      Environment:
+        Variables:
+          EnvAutoStopTag: !Ref AutoStopTag
+      Role: !GetAtt 'RoleAutoStopLambda.Arn'
+      Runtime: python2.7
+      Timeout: '300'
+
+  RoleAutoStopLambda:
+    Type: AWS::IAM::Role
+    Condition: DeployAutoStopCondition
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: auto_stop_lambda_role
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:CreateLogGroup
+                  - logs:PutLogEvents
+                  - ec2:StopInstances
+                Resource:
+                  - arn:aws:logs:*:*:*
+                  - arn:aws:ec2:*:*:instance/*
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeRegions
+                Resource: "*"
+
+  LambdaAutoStopSchedule:
+    Type: "AWS::Events::Rule"
+    Condition: DeployAutoStopCondition
+    Properties:
+      Description: Trigger frequency of the AutoStop
+      ScheduleExpression: !Ref AutoStopRate
+      State: ENABLED
+      Targets:
+        - Arn: !Sub ${LambdaAutoStopFunction.Arn}
+          Id: LambdaAutoStop
+
+  LambdaScheduleAutoStopPermission:
+    Type: "AWS::Lambda::Permission"
+    Condition: DeployAutoStopCondition
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Sub ${LambdaAutoStopFunction.Arn}
+      Principal: 'events.amazonaws.com'
+      SourceArn: !Sub ${LambdaAutoStopSchedule.Arn}
+
+  LambdaAutoStartFunction:
+    Type: AWS::Lambda::Function
+    Condition: DeployAutoStartCondition
+    Properties:
+      Code:
+        ZipFile: |
+          from __future__ import print_function
+          import boto3
+          import time
+          import os
+          filters_auto_start = [
+              {
+                  'Name': 'tag:' + os.environ['EnvAutoStartTag'],
+                  'Values': ['True', 'true']
+              },
+              {
+                  'Name': 'instance-state-name',
+                  'Values': ['stopped']
+              }
+          ]
+
+          def get_tag_value(instance, key):
+              for tags in instance.tags:
+                  if tags["Key"] == key:
+                      return tags["Value"]
+              return null
+
+          def auto_start_all_regions():
+              ec2 = boto3.resource('ec2')
+              ec2_client = boto3.client('ec2')
+              
+              filters = list(filters_auto_start)
+              
+              for region in ec2_client.describe_regions()['Regions']:
+                  print("-----  Start instances for region %s  -----" % (region['RegionName']))
+                  ec2 = boto3.resource('ec2', region_name=region['RegionName'])
+                  instances = list(ec2.instances.filter(Filters=filters))
+                  if len(instances) > 0:
+                      print("\t%s instance(s) to start" % (len(instances)))
+              
+                      for instance in instances:
+                          print("\tStart: %s" % (get_tag_value(instance,'Name')))
+                          instance.start()
+              
+                      for instance in instances:
+                          print("\tWait instance running: %s" % (get_tag_value(instance,'Name')))
+                          instance.wait_until_running()
+
+          def lambda_handler(event, context):
+              auto_start_all_regions()
+
+          if __name__ == '__main__':
+              lambda_handler(None, None)
+
+      Handler: index.lambda_handler
+      FunctionName: !Sub
+        - ${AutoStartTag}_all_regions
+        - { AutoStartTag: !Ref AutoStartTag }
+      Environment:
+        Variables:
+          EnvAutoStartTag: !Ref AutoStartTag
+      Role: !GetAtt 'RoleAutoStartLambda.Arn'
+      Runtime: python2.7
+      Timeout: '300'
+
+  RoleAutoStartLambda:
+    Type: AWS::IAM::Role
+    Condition: DeployAutoStartCondition
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: auto_start_lambda_role
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:CreateLogGroup
+                  - logs:PutLogEvents
+                  - ec2:StartInstances
+                Resource: 
+                  - arn:aws:logs:*:*:*  
+                  - arn:aws:ec2:*:*:instance/*
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeRegions
+                Resource: "*"
+
+  LambdaAutoStartSchedule:
+    Type: "AWS::Events::Rule"
+    Condition: DeployAutoStartCondition
+    Properties:
+      Description: Trigger frequency of the AutoStart
+      ScheduleExpression: !Ref AutoStartRate
+      State: ENABLED
+      Targets:
+        - Arn: !Sub ${LambdaAutoStartFunction.Arn}
+          Id: LambdaAutoStart
+
+  LambdaScheduleAutoStartPermission:
+    Type: "AWS::Lambda::Permission"
+    Condition: DeployAutoStartCondition
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Sub ${LambdaAutoStartFunction.Arn}
+      Principal: 'events.amazonaws.com'
+      SourceArn: !Sub ${LambdaAutoStartSchedule.Arn}
